@@ -1,0 +1,177 @@
+source /run/secrets/config_vars
+
+switch $httpport {
+	80 {
+		set server_url "http://$hostname"
+		set suppress_port 1
+	}
+	443 {
+		set server_url "https://$hostname"
+		set suppress_port 1
+	}
+	default {
+		set server_url "http://${hostname}:$httpport"
+		set suppress_port 0
+	}
+}
+
+parameter::set_from_package_key -package_key acs-kernel -parameter "SystemURL" -value $server_url
+parameter::set_from_package_key -package_key intranet-core -parameter "UtilCurrentLocationRedirect" -value $server_url
+    
+parameter::set_from_package_key -package_key acs-kernel -parameter "SystemOwner" -value $system_owner
+parameter::set_from_package_key -package_key acs-tcl -parameter "SuppressHttpPort" -value $suppress_port
+    
+parameter::set_from_package_key -package_key intranet-core -parameter "BackupBasePathUnix" -value "${serverroot}/filestorage/backup"
+parameter::set_from_package_key -package_key intranet-filestorage -parameter "BugBasePathUnix" -value "${serverroot}/filestorage/bugs"
+parameter::set_from_package_key -package_key intranet-filestorage -parameter "CompanyBasePathUnix" -value "${serverroot}/filestorage/companies"
+parameter::set_from_package_key -package_key intranet-filestorage -parameter "HomeBasePathUnix" -value "${serverroot}/filestorage/home"
+parameter::set_from_package_key -package_key intranet-filestorage -parameter "ProjectBasePathUnix" -value "${serverroot}/filestorage/projects"
+parameter::set_from_package_key -package_key intranet-filestorage -parameter "ProjectSalesBasePathUnix" -value "${serverroot}/filestorage/project_sales"
+parameter::set_from_package_key -package_key intranet-filestorage -parameter "TicketBasePathUnix" -value "${serverroot}/filestorage/tickets"
+parameter::set_from_package_key -package_key intranet-filestorage -parameter "UserBasePathUnix" -value "${serverroot}/filestorage/users"
+parameter::set_from_package_key -package_key intranet-filestorage -parameter "CostBasePathUnix" -value "${serverroot}/filestorage/costs"
+parameter::set_from_package_key -package_key intranet-filestorage -parameter "EventBasePathUnix" -value "${serverroot}/filestorage/events"
+parameter::set_from_package_key -package_key intranet-invoices -parameter "InvoiceTemplatePathUnix" -value "${serverroot}/filestorage/templates"
+
+
+# Set parameters for redirecting mail
+if {$develop_p || $staging_p} {
+	parameter::set_from_package_key -package_key acs-mail-lite -parameter "EmailDeliveryMode" -value "redirect"
+	parameter::set_from_package_key -package_key acs-mail-lite -parameter "EmailRedirectTo" -value "$system_owner"
+	parameter::set_from_package_key -package_key intranet-core -parameter "TestDemoDevServer" -value "1"
+    if {[apm_package_installed_p xotcl-core]} {
+        parameter::set_from_package_key -package_key xotcl-core -parameter "NslogRedirector" -value "1"
+    }
+	if {[apm_package_installed_p intranet-collmex]} {
+	    parameter::set_from_package_key -package_key intranet-collmex -parameter "ActiveP" -value "0"
+	    parameter::set_from_package_key -package_key intranet-collmex -parameter "Login" -value ""
+    }
+}
+
+if { $staging_p } {
+    parameter::set_from_package_key -package_key intranet-core -parameter "MaintenanceMessage" -value "THIS IS A STAGING SERVER. THIS IS NOT PRODUCTION!"
+}
+
+# Get the mail bounce domain
+set smtp_domain [parameter::get_from_package_key -package_key acs-mail-lite -parameter SMTPHost]
+if {$smtp_domain ne "localhost"} {
+    set bounce_domain [join [lrange [split $smtp_domain .] end-1 end] .]
+} else {
+	set sender_mail [parameter::get_from_package_key -package_key acs-mail-lite -parameter FixedSenderEmail]
+	if {$sender_mail eq ""} { set sender_mail  [parameter::get_from_package_key -package_key acs-mail-lite -parameter NotificationSender] }
+	if {$sender_mail eq ""} { set sender_mail  [parameter::get_from_package_key -package_key acs-mail-lite -parameter NotificationSender] }
+	if {$sender_mail eq ""} { set sender_mail  [parameter::get_from_package_key -package_key acs-kernel -parameter SystemOwner] }
+	if {$sender_mail ne ""} {
+	    set bounce_domain [lindex [split $sender_mail "@"] end]
+	    parameter::set_from_package_key -package_key acs-mail-lite -parameter "BounceDomain" -value "$bounce_domain"
+	}
+}
+
+#
+# Retrieve all spec files
+#
+set package_key ""
+set packages_spec_files     [apm_scan_packages "$::acs::rootdir/packages"]
+set workspace_spec_files    [apm_scan_packages [apm_workspace_install_dir]]
+set workspace_filenames     [list]
+foreach spec_path $workspace_spec_files {
+    lappend workspace_filenames [file tail $spec_path]
+}
+set all_spec_files $workspace_spec_files
+foreach spec_path $packages_spec_files {
+    set spec_filename [file tail $spec_path]
+    if {$spec_filename ni $workspace_filenames} {
+        lappend all_spec_files $spec_path
+    }
+}
+#
+# Parse the files and make a list of available packages to upgrade
+#
+set packages_to_upgrade [list]
+foreach spec_file $all_spec_files {
+    array set version    [apm_read_package_info_file $spec_file]
+    set this_version     $version(name)
+    set this_package_key $version(package.key)
+    #
+    # Filter by package_key, if passed as an argument, and check for upgrades
+    #
+    if {($package_key eq "" || $package_key eq $this_package_key) &&
+        [apm_package_supports_rdbms_p -package_key $this_package_key] &&
+        [apm_package_registered_p $this_package_key] &&
+        [apm_package_installed_p $this_package_key] &&
+        [apm_higher_version_installed_p $this_package_key $this_version] eq 1
+    } {
+        #
+        # Add the package to the list
+        #
+        lappend packages_to_upgrade $this_package_key
+    }
+}
+
+#
+# Are there packages to upgrade?
+#
+if {$packages_to_upgrade ne ""} {
+    #
+    # Dependency check
+    #
+    apm_get_package_repository -array repository
+    apm_get_installed_versions -array installed
+    ns_log notice "ci-packages-upgrade: run apm_dependency_check_new with <$packages_to_upgrade>"
+    array set result [apm_dependency_check_new \
+                          -repository_array repository \
+                          -package_keys $packages_to_upgrade]
+    ns_log notice "ci-packages-upgrade: apm_dependency_check_new with <$packages_to_upgrade>: [array get result]"
+    if {$result(status) eq "ok"} {
+        #
+        # Do the upgrade
+        #
+        foreach package_key $result(install) {
+            #
+            # As we may have new packages included by the dependency check,
+            # determine if we are upgrading or installing.
+            #
+            set spec_file       [apm_package_info_file_path $package_key]
+            array set version   [apm_read_package_info_file $spec_file]
+            set new_version     $version(name)
+            if { [apm_package_upgrade_p $package_key $new_version] == 1} {
+                set installed_version [apm_highest_version_name $package_key]
+                ns_log Warning "ci-packages-upgrade: $package_key ($installed_version -> $new_version)"
+            } else {
+                set installed_version ""
+                ns_log Warning "ci-packages-upgrade: $package_key (fresh install $new_version)"
+            }
+            #
+            # Select SQL scripts
+            #
+            set data_model_files [apm_data_model_scripts_find \
+                                      -upgrade_from_version_name $installed_version \
+                                      -upgrade_to_version_name $new_version \
+                                      $package_key]
+            ns_log Warning "ci-packages-upgrade: $package_key datamodel files: $data_model_files"
+            #
+            # Upgrade the package
+            #
+            if {[catch {
+                ns_log notice "===== INSTALL $package_key"
+                set version_id [apm_package_install \
+                        -enable=1 \
+                        -load_data_model \
+                        -data_model_files $data_model_files \
+                        $spec_file]
+                #
+                # Upgrade successful
+                #
+                ns_log notice "===== INSTALL $package_key DONE"
+            } errorMsg]} {
+                #
+                # Upgrade failed
+                #
+                ns_log Error "ci-packages-upgrade: $package_key $errorMsg\n [ns_quotehtml $::errorInfo]"
+            }
+        }
+    }
+}
+
+# Remove the file so it wont run after the first start of the container
+file delete ${serverroot}/tcl/config.tcl.postload
